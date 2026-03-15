@@ -14,7 +14,7 @@ class Program
         string rootDirectory = args.Length > 0 ? args[0] : null;
 
         using var cts = new CancellationTokenSource();
-        var serverTask = StartServerAsync(prefixes, rootDirectory, cts.Token);
+        var serverTask = StartServer(prefixes, rootDirectory, cts.Token);
 
         Console.WriteLine("Server started. Press Enter to stop...");
         Console.ReadLine();
@@ -24,7 +24,7 @@ class Program
         Console.WriteLine("Server stopped gracefully.");
     }
 
-    static async Task StartServerAsync(string[] prefixes, string rootDirectory, CancellationToken cancellationToken)
+    static async Task StartServer(string[] prefixes, string rootDirectory, CancellationToken cancellationToken)
     {
         if (prefixes == null || prefixes.Length == 0)
             throw new ArgumentException("prefixes");
@@ -37,7 +37,7 @@ class Program
         foreach (string s in prefixes)
             listener.Prefixes.Add(s);
 
-        using var registration = cancellationToken.Register(() => listener.Stop());
+        cancellationToken.Register(() => listener.Stop());
 
         listener.Start();
         Console.WriteLine($"Listening... (root: {rootDirectory})");
@@ -54,12 +54,12 @@ class Program
                 {
                     context = await listener.GetContextAsync().ConfigureAwait(false);
                 }
-                catch (HttpListenerException ex) when (ex.ErrorCode == 995)
+                catch (Exception ex)
                 {
                     break;
                 }
 
-                var task = HandleRequestAsync(context, rootDirectory, logFile, logLock);
+                var task = HandleRequest(context, rootDirectory, logFile, logLock);
                 lock (tasksLock)
                 {
                     activeTasks.Add(task);
@@ -96,7 +96,7 @@ class Program
         }
     }
 
-    static async Task HandleRequestAsync(HttpListenerContext context, string rootDirectory, string logFile, object logLock)
+    static async Task HandleRequest(HttpListenerContext context, string rootDirectory, string logFile, object logLock)
     {
         HttpListenerRequest request = context.Request;
         HttpListenerResponse response = context.Response;
@@ -107,7 +107,7 @@ class Program
             if (request.HttpMethod != "GET")
             {
                 response.StatusCode = 405;
-                await SendErrorPageAsync(response, "405 - Method Not Allowed");
+                await SendErrorPage(response, "405 - Method Not Allowed");
                 statusCode = 405;
             }
             else
@@ -122,7 +122,7 @@ class Program
                 {
                     response.StatusCode = 404;
                     response.StatusDescription = "Not Found";
-                    await SendErrorPageAsync(response, "404 - Not Found");
+                    await SendErrorPage(response, "404 - Not Found");
                     statusCode = 404;
                 }
                 else if (File.Exists(fullPath))
@@ -136,7 +136,7 @@ class Program
                 {
                     response.StatusCode = 404;
                     response.StatusDescription = "Not Found";
-                    await SendErrorPageAsync(response, "404 - Not Found");
+                    await SendErrorPage(response, "404 - Not Found");
                     statusCode = 404;
                 }
             }
@@ -152,7 +152,7 @@ class Program
             response.StatusDescription = "Internal Server Error";
             try
             {
-                await SendErrorPageAsync(response, "500 - Internal Server Error");
+                await SendErrorPage(response, "500 - Internal Server Error");
             }
             catch (Exception innerEx) when (IsConnectionAbortError(innerEx))
             {
@@ -210,7 +210,7 @@ class Program
         }
     }
 
-    static async Task SendErrorPageAsync(HttpListenerResponse response, string message)
+    static async Task SendErrorPage(HttpListenerResponse response, string message)
     {
         byte[] buffer = Encoding.UTF8.GetBytes($"<html><body><h1>{message}</h1></body></html>");
         response.ContentType = "text/html; charset=utf-8";
