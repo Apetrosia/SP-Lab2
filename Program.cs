@@ -59,7 +59,6 @@ class Program
                     break;
                 }
 
-                // Запускаем обработку запроса в отдельной задаче
                 var task = HandleRequestAsync(context, rootDirectory, logFile, logLock);
                 lock (tasksLock)
                 {
