@@ -1,195 +1,125 @@
 using System;
 using System.Collections.Generic;
-using System.Net;
 using System.IO;
+using System.Net;
 using System.Text;
-using System.Threading.Tasks;
 using System.Threading;
-using System.Linq;
+using System.Threading.Tasks;
 
 class Program
 {
-    private static int _activeRequests = 0;
-    private static readonly object _logLock = new object();
-    private static string _logFile = "requests.log"; // Единый файл логов
-
     static async Task Main(string[] args)
     {
         string[] prefixes = { "http://localhost:8080/" };
         string rootDirectory = args.Length > 0 ? args[0] : null;
-        await StartServerAsync(prefixes, rootDirectory);
+
+        using var cts = new CancellationTokenSource();
+        var serverTask = StartServerAsync(prefixes, rootDirectory, cts.Token);
+
+        Console.WriteLine("Server started. Press Enter to stop...");
+        Console.ReadLine();            // консольная «кнопка» остановки
+        cts.Cancel();
+
+        await serverTask;
+        Console.WriteLine("Server stopped gracefully.");
     }
 
-    static async Task StartServerAsync(string[] prefixes, string rootDirectory = null)
+    static async Task StartServerAsync(string[] prefixes, string rootDirectory, CancellationToken cancellationToken)
     {
         if (prefixes == null || prefixes.Length == 0)
             throw new ArgumentException("prefixes");
 
         rootDirectory = rootDirectory ?? Directory.GetCurrentDirectory();
+        string logFile = "requests.log";
+        object logLock = new object();
 
-        HttpListener listener = new HttpListener();
+        using var listener = new HttpListener();
         foreach (string s in prefixes)
             listener.Prefixes.Add(s);
 
+        // При отмене токена останавливаем listener – это прервёт ожидание GetContextAsync
+        using var registration = cancellationToken.Register(() => listener.Stop());
+
         listener.Start();
+        Console.WriteLine($"Listening... (root: {rootDirectory})");
 
-        // Выводим информацию о запуске
-        Console.WriteLine("Listening on:");
-        foreach (string prefix in prefixes)
-        {
-            Console.WriteLine($"  {prefix}");
-        }
-        Console.WriteLine($"Root directory: {rootDirectory}");
-        Console.WriteLine("Press 'q' to stop the server gracefully.");
-
-        // Список запущенных задач обработки запросов
-        var runningTasks = new List<Task>();
+        var activeTasks = new List<Task>();
         var tasksLock = new object();
-
-        // Токен отмены для graceful shutdown
-        var shutdownTokenSource = new CancellationTokenSource();
-
-        // Обработка Ctrl+C
-        Console.CancelKeyPress += (sender, e) =>
-        {
-            e.Cancel = true; // предотвращаем немедленное завершение
-            LogServerEvent($"Ctrl+C pressed. Active requests: {_activeRequests}. Initiating shutdown...");
-            shutdownTokenSource.Cancel();
-        };
-
-        // Обработка завершения процесса (например, закрытие окна)
-        AppDomain.CurrentDomain.ProcessExit += (sender, e) =>
-        {
-            // Здесь уже мало времени, но попробуем залогировать
-            string msg = $"Process exiting. Active requests: {_activeRequests}. Trying to shutdown...";
-            Console.WriteLine(msg);
-            // Попытка записи в файл может не успеть
-            try
-            {
-                lock (_logLock)
-                {
-                    File.AppendAllLines(_logFile, new[] { $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} | [SERVER] {msg}" });
-                }
-            }
-            catch { }
-            // Принудительно отменяем, но процесс всё равно завершится
-            shutdownTokenSource.Cancel();
-        };
-
-        // Задача для отслеживания нажатия клавиши 'q'
-        var shutdownTask = Task.Run(() =>
-        {
-            while (!shutdownTokenSource.IsCancellationRequested)
-            {
-                if (Console.KeyAvailable)
-                {
-                    var key = Console.ReadKey(true);
-                    if (key.KeyChar == 'q' || key.KeyChar == 'Q')
-                    {
-                        LogServerEvent($"Shutdown signal received (key 'q'). Active requests: {_activeRequests}. Initiating shutdown...");
-                        shutdownTokenSource.Cancel();
-                        break;
-                    }
-                }
-                Thread.Sleep(100);
-            }
-        });
 
         try
         {
-            // Основной цикл приема запросов
-            while (!shutdownTokenSource.IsCancellationRequested)
+            while (!cancellationToken.IsCancellationRequested)
             {
-                // Асинхронно ожидаем входящий запрос
-                var getContextTask = listener.GetContextAsync();
-                // Ждем либо запрос, либо сигнал остановки
-                var completedTask = await Task.WhenAny(getContextTask, shutdownTask);
-                if (completedTask == shutdownTask || shutdownTokenSource.IsCancellationRequested)
+                HttpListenerContext context;
+                try
                 {
-                    // Получен сигнал остановки – выходим из цикла
+                    context = await listener.GetContextAsync().ConfigureAwait(false);
+                }
+                catch (HttpListenerException ex) when (ex.ErrorCode == 995) // Ожидаемо при остановке listener
+                {
                     break;
                 }
 
-                // Получаем контекст запроса
-                var context = await getContextTask;
-
-                // Увеличиваем счетчик активных запросов
-                Interlocked.Increment(ref _activeRequests);
-
-                // Запускаем обработку в отдельной задаче
-                var processingTask = Task.Run(() => HandleRequestAsync(context, rootDirectory));
-
-                // Добавляем задачу в список активных
+                // Запускаем обработку запроса в отдельной задаче
+                var task = HandleRequestAsync(context, rootDirectory, logFile, logLock);
                 lock (tasksLock)
                 {
-                    // Удаляем уже завершенные задачи для очистки списка
-                    runningTasks.RemoveAll(t => t.IsCompleted);
-                    runningTasks.Add(processingTask);
+                    activeTasks.Add(task);
+                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] New task started. Active tasks: {activeTasks.Count}");
                 }
 
-                // Логируем создание таска
-                string path = context.Request.Url.AbsolutePath;
-                LogServerEvent($"Task started for {path}. Active requests: {_activeRequests}");
-
-                // Добавляем продолжение для логирования завершения задачи
-                processingTask.ContinueWith(t =>
+                // После завершения задачи удаляем её из списка активных
+                _ = task.ContinueWith(t =>
                 {
-                    int remaining = Interlocked.Decrement(ref _activeRequests);
-                    LogServerEvent($"Task completed for {path}. Active requests: {remaining}");
-                }, TaskContinuationOptions.ExecuteSynchronously);
+                    lock (tasksLock)
+                    {
+                        activeTasks.Remove(t);
+                        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Task completed. Active tasks: {activeTasks.Count}");
+                    }
+                }, TaskScheduler.Default);
             }
         }
-        catch (OperationCanceledException)
+        catch (Exception ex)
         {
-            // Ожидаемая отмена
+            Console.WriteLine($"Unexpected error in accept loop: {ex}");
         }
         finally
         {
-            // Останавливаем прием новых запросов
-            listener.Stop();
-            listener.Close();
-            LogServerEvent("Listener stopped. Waiting for pending requests to complete...");
+            // Останавливаем приём новых запросов
+            if (listener.IsListening)
+                listener.Stop();
 
-            // Дожидаемся завершения всех активных задач обработки
+            // Ждём завершения всех уже запущенных обработчиков
+            Console.WriteLine($"Waiting for {activeTasks.Count} tasks to complete...");
             Task[] tasksToWait;
             lock (tasksLock)
             {
-                tasksToWait = runningTasks.ToArray();
+                tasksToWait = activeTasks.ToArray();
             }
-            if (tasksToWait.Length > 0)
-                await Task.WhenAll(tasksToWait);
-
-            LogServerEvent($"All requests processed. Server shut down. Final active requests: {_activeRequests}");
+            await Task.WhenAll(tasksToWait).ConfigureAwait(false);
+            Console.WriteLine("All tasks completed.");
         }
     }
 
-    // Асинхронная обработка запроса с искусственной задержкой 5 секунд
-    static async Task HandleRequestAsync(HttpListenerContext context, string rootDirectory)
+    static async Task HandleRequestAsync(HttpListenerContext context, string rootDirectory, string logFile, object logLock)
     {
         HttpListenerRequest request = context.Request;
         HttpListenerResponse response = context.Response;
 
         int statusCode = 200;
-
         try
         {
-            // Искусственная задержка 5 секунд для имитации долгой обработки
-            await Task.Delay(5000);
-
             if (request.HttpMethod != "GET")
             {
                 response.StatusCode = 405;
-                SendErrorPage(response, "405 - Method Not Allowed");
+                await SendErrorPageAsync(response, "405 - Method Not Allowed");
                 statusCode = 405;
             }
             else
             {
                 string path = request.Url.AbsolutePath.TrimStart('/');
-
                 if (request.Url.AbsolutePath == "/")
-                {
                     path = "index.html";
-                }
 
                 string fullPath = Path.GetFullPath(Path.Combine(rootDirectory, path));
 
@@ -197,39 +127,77 @@ class Program
                 {
                     response.StatusCode = 404;
                     response.StatusDescription = "Not Found";
-                    SendErrorPage(response, "404 - Not Found");
+                    await SendErrorPageAsync(response, "404 - Not Found");
                     statusCode = 404;
                 }
                 else if (File.Exists(fullPath))
                 {
-                    SendFile(response, fullPath);
+                    // Искусственная задержка 1 секунда – для проверки graceful shutdown
+                    await Task.Delay(5000).ConfigureAwait(false);
+
+                    await SendFileAsync(response, fullPath);
                     statusCode = 200;
                 }
                 else
                 {
                     response.StatusCode = 404;
                     response.StatusDescription = "Not Found";
-                    SendErrorPage(response, "404 - Not Found");
+                    await SendErrorPageAsync(response, "404 - Not Found");
                     statusCode = 404;
                 }
             }
         }
+        catch (Exception ex) when (IsConnectionAbortError(ex))
+        {
+            // Клиент разорвал соединение – просто логируем и выходим
+            Console.WriteLine($"Client aborted connection: {ex.Message}");
+            statusCode = 499; // Нестандартный код для "Client Closed Request"
+        }
         catch (Exception ex)
         {
+            // Другие ошибки обработки – пытаемся отправить 500
             response.StatusCode = 500;
             response.StatusDescription = "Internal Server Error";
-            SendErrorPage(response, "500 - Internal Server Error");
+            try
+            {
+                await SendErrorPageAsync(response, "500 - Internal Server Error");
+            }
+            catch (Exception innerEx) when (IsConnectionAbortError(innerEx))
+            {
+                Console.WriteLine($"Client aborted during error page: {innerEx.Message}");
+            }
+            catch (Exception innerEx)
+            {
+                Console.WriteLine($"Failed to send error page: {innerEx}");
+            }
             statusCode = 500;
             Console.WriteLine($"Error: {ex}");
         }
         finally
         {
-            WriteLog(request, statusCode);
-            response.OutputStream.Close();
+            // Закрываем поток ответа с обработкой возможной ошибки
+            try
+            {
+                response.OutputStream.Close();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Warning: failed to close response stream: {ex.Message}");
+            }
+
+            WriteLog(request, statusCode, logFile, logLock);
         }
     }
 
-    static void SendFile(HttpListenerResponse response, string filePath)
+    // Проверка, является ли исключение следствием обрыва соединения клиентом
+    private static bool IsConnectionAbortError(Exception ex)
+    {
+        return ex is ObjectDisposedException ||
+               (ex is HttpListenerException hle && hle.ErrorCode == 995) || // ERROR_OPERATION_ABORTED
+               (ex is IOException && ex.InnerException is HttpListenerException ihle && ihle.ErrorCode == 995);
+    }
+
+    static async Task SendFileAsync(HttpListenerResponse response, string filePath)
     {
         string extension = Path.GetExtension(filePath);
         var mimeTypes = new Dictionary<string, string>
@@ -248,19 +216,19 @@ class Program
         using (FileStream fs = File.OpenRead(filePath))
         {
             response.ContentLength64 = fs.Length;
-            fs.CopyTo(response.OutputStream);
+            await fs.CopyToAsync(response.OutputStream).ConfigureAwait(false);
         }
     }
 
-    static void SendErrorPage(HttpListenerResponse response, string message)
+    static async Task SendErrorPageAsync(HttpListenerResponse response, string message)
     {
         byte[] buffer = Encoding.UTF8.GetBytes($"<html><body><h1>{message}</h1></body></html>");
         response.ContentType = "text/html; charset=utf-8";
         response.ContentLength64 = buffer.Length;
-        response.OutputStream.Write(buffer, 0, buffer.Length);
+        await response.OutputStream.WriteAsync(buffer, 0, buffer.Length).ConfigureAwait(false);
     }
 
-    static void WriteLog(HttpListenerRequest request, int statusCode)
+    static void WriteLog(HttpListenerRequest request, int statusCode, string logFile, object logLock)
     {
         string ip = request.RemoteEndPoint?.Address?.ToString() ?? "unknown";
         string path = request.Url.AbsolutePath;
@@ -268,22 +236,9 @@ class Program
         string method = request.HttpMethod;
         string logLine = $"{date} | {method} | IP: {ip} | Path: {path} | Code: {statusCode}";
 
-        lock (_logLock)
+        lock (logLock)
         {
-            File.AppendAllLines(_logFile, new[] { logLine });
-        }
-        Console.WriteLine(logLine);
-    }
-
-    // Логирование серверных событий (в тот же файл, но с префиксом [SERVER])
-    static void LogServerEvent(string message)
-    {
-        string date = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
-        string logLine = $"{date} | [SERVER] {message}";
-
-        lock (_logLock)
-        {
-            File.AppendAllLines(_logFile, new[] { logLine });
+            File.AppendAllLines(logFile, new[] { logLine });
         }
         Console.WriteLine(logLine);
     }
