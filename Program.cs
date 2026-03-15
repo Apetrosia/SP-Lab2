@@ -17,7 +17,7 @@ class Program
         var serverTask = StartServerAsync(prefixes, rootDirectory, cts.Token);
 
         Console.WriteLine("Server started. Press Enter to stop...");
-        Console.ReadLine();            // консольная «кнопка» остановки
+        Console.ReadLine();
         cts.Cancel();
 
         await serverTask;
@@ -37,7 +37,6 @@ class Program
         foreach (string s in prefixes)
             listener.Prefixes.Add(s);
 
-        // При отмене токена останавливаем listener – это прервёт ожидание GetContextAsync
         using var registration = cancellationToken.Register(() => listener.Stop());
 
         listener.Start();
@@ -55,7 +54,7 @@ class Program
                 {
                     context = await listener.GetContextAsync().ConfigureAwait(false);
                 }
-                catch (HttpListenerException ex) when (ex.ErrorCode == 995) // Ожидаемо при остановке listener
+                catch (HttpListenerException ex) when (ex.ErrorCode == 995)
                 {
                     break;
                 }
@@ -68,7 +67,6 @@ class Program
                     Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] New task started. Active tasks: {activeTasks.Count}");
                 }
 
-                // После завершения задачи удаляем её из списка активных
                 _ = task.ContinueWith(t =>
                 {
                     lock (tasksLock)
@@ -85,11 +83,9 @@ class Program
         }
         finally
         {
-            // Останавливаем приём новых запросов
             if (listener.IsListening)
                 listener.Stop();
 
-            // Ждём завершения всех уже запущенных обработчиков
             Console.WriteLine($"Waiting for {activeTasks.Count} tasks to complete...");
             Task[] tasksToWait;
             lock (tasksLock)
@@ -132,7 +128,6 @@ class Program
                 }
                 else if (File.Exists(fullPath))
                 {
-                    // Искусственная задержка 1 секунда – для проверки graceful shutdown
                     await Task.Delay(5000).ConfigureAwait(false);
 
                     await SendFileAsync(response, fullPath);
@@ -149,13 +144,11 @@ class Program
         }
         catch (Exception ex) when (IsConnectionAbortError(ex))
         {
-            // Клиент разорвал соединение – просто логируем и выходим
             Console.WriteLine($"Client aborted connection: {ex.Message}");
-            statusCode = 499; // Нестандартный код для "Client Closed Request"
+            statusCode = 499;
         }
         catch (Exception ex)
         {
-            // Другие ошибки обработки – пытаемся отправить 500
             response.StatusCode = 500;
             response.StatusDescription = "Internal Server Error";
             try
@@ -175,7 +168,6 @@ class Program
         }
         finally
         {
-            // Закрываем поток ответа с обработкой возможной ошибки
             try
             {
                 response.OutputStream.Close();
@@ -189,11 +181,10 @@ class Program
         }
     }
 
-    // Проверка, является ли исключение следствием обрыва соединения клиентом
     private static bool IsConnectionAbortError(Exception ex)
     {
         return ex is ObjectDisposedException ||
-               (ex is HttpListenerException hle && hle.ErrorCode == 995) || // ERROR_OPERATION_ABORTED
+               (ex is HttpListenerException hle && hle.ErrorCode == 995) ||
                (ex is IOException && ex.InnerException is HttpListenerException ihle && ihle.ErrorCode == 995);
     }
 
