@@ -47,29 +47,31 @@ class Program
         {
             while (!cancellationToken.IsCancellationRequested)
             {
-                var getContextTask = listener.GetContextAsync();
-                var completedTask = await Task.WhenAny(getContextTask, Task.Delay(-1, cancellationToken));
-
-                if (completedTask == getContextTask)
+                HttpListenerContext context;
+                try
                 {
-                    var context = await getContextTask;
+                    context = await listener.GetContextAsync().ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    break;
+                }
 
-                    var task = HandleRequest(context, rootDirectory, logFile, logLock);
+                var task = HandleRequest(context, rootDirectory, logFile, logLock);
+                lock (tasksLock)
+                {
+                    activeTasks.Add(task);
+                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] New task started. Active tasks: {activeTasks.Count}");
+                }
+
+                _ = task.ContinueWith(t =>
+                {
                     lock (tasksLock)
                     {
-                        activeTasks.Add(task);
-                        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] New task started. Active tasks: {activeTasks.Count}");
+                        activeTasks.Remove(t);
+                        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Task completed. Active tasks: {activeTasks.Count}");
                     }
-
-                    _ = task.ContinueWith(t =>
-                    {
-                        lock (tasksLock)
-                        {
-                            activeTasks.Remove(t);
-                            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Task completed. Active tasks: {activeTasks.Count}");
-                        }
-                    }, TaskScheduler.Default);
-                }
+                }, TaskScheduler.Default);
             }
         }
         catch (Exception ex) when (!(ex is OperationCanceledException))
