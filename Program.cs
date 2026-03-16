@@ -72,10 +72,6 @@ class Program
                         }
                     }, TaskScheduler.Default);
                 }
-                else
-                {
-                    break;
-                }
             }
         }
         catch (Exception ex) when (!(ex is OperationCanceledException))
