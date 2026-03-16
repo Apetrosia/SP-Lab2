@@ -80,8 +80,6 @@ class Program
         }
         finally
         {
-            if (listener.IsListening)
-                listener.Stop();
             Console.WriteLine($"Waiting for {activeTasks.Count} tasks to complete...");
             Task[] tasksToWait;
             lock (tasksLock)
@@ -90,7 +88,7 @@ class Program
             }
             await Task.WhenAll(tasksToWait);
 
-            listener.Close();
+            listener.Stop();
 
             Console.WriteLine("All tasks completed, listener stopped.");
         }
