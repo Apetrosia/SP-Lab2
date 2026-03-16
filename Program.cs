@@ -37,62 +37,65 @@ class Program
         foreach (string s in prefixes)
             listener.Prefixes.Add(s);
 
-        cancellationToken.Register(() => listener.Stop());
-
         listener.Start();
         Console.WriteLine($"Listening... (root: {rootDirectory})");
 
         var activeTasks = new List<Task>();
         var tasksLock = new object();
 
+        using var acceptCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+
         try
         {
-            while (!cancellationToken.IsCancellationRequested)
+            while (!acceptCts.Token.IsCancellationRequested)
             {
-                HttpListenerContext context;
-                try
+                var getContextTask = listener.GetContextAsync();
+                var completedTask = await Task.WhenAny(getContextTask, Task.Delay(-1, acceptCts.Token));
+
+                if (completedTask == getContextTask)
                 {
-                    context = await listener.GetContextAsync().ConfigureAwait(false);
+                    var context = await getContextTask;
+
+                    var task = HandleRequest(context, rootDirectory, logFile, logLock);
+                    lock (tasksLock)
+                    {
+                        activeTasks.Add(task);
+                        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] New task started. Active tasks: {activeTasks.Count}");
+                    }
+
+                    _ = task.ContinueWith(t =>
+                    {
+                        lock (tasksLock)
+                        {
+                            activeTasks.Remove(t);
+                            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Task completed. Active tasks: {activeTasks.Count}");
+                        }
+                    }, TaskScheduler.Default);
                 }
-                catch (Exception ex)
+                else
                 {
                     break;
                 }
-
-                var task = HandleRequest(context, rootDirectory, logFile, logLock);
-                lock (tasksLock)
-                {
-                    activeTasks.Add(task);
-                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] New task started. Active tasks: {activeTasks.Count}");
-                }
-
-                _ = task.ContinueWith(t =>
-                {
-                    lock (tasksLock)
-                    {
-                        activeTasks.Remove(t);
-                        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Task completed. Active tasks: {activeTasks.Count}");
-                    }
-                }, TaskScheduler.Default);
             }
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!(ex is OperationCanceledException))
         {
             Console.WriteLine($"Unexpected error in accept loop: {ex}");
         }
         finally
         {
-            if (listener.IsListening)
-                listener.Stop();
-
             Console.WriteLine($"Waiting for {activeTasks.Count} tasks to complete...");
             Task[] tasksToWait;
             lock (tasksLock)
             {
                 tasksToWait = activeTasks.ToArray();
             }
-            await Task.WhenAll(tasksToWait).ConfigureAwait(false);
-            Console.WriteLine("All tasks completed.");
+            await Task.WhenAll(tasksToWait);
+
+            if (listener.IsListening)
+                listener.Stop();
+
+            Console.WriteLine("All tasks completed, listener stopped.");
         }
     }
 
@@ -127,7 +130,7 @@ class Program
                 }
                 else if (File.Exists(fullPath))
                 {
-                    await Task.Delay(5000).ConfigureAwait(false);
+                    await Task.Delay(3000);
 
                     await SendFileAsync(response, fullPath);
                     statusCode = 200;
@@ -206,7 +209,7 @@ class Program
         using (FileStream fs = File.OpenRead(filePath))
         {
             response.ContentLength64 = fs.Length;
-            await fs.CopyToAsync(response.OutputStream).ConfigureAwait(false);
+            await fs.CopyToAsync(response.OutputStream);
         }
     }
 
@@ -215,7 +218,7 @@ class Program
         byte[] buffer = Encoding.UTF8.GetBytes($"<html><body><h1>{message}</h1></body></html>");
         response.ContentType = "text/html; charset=utf-8";
         response.ContentLength64 = buffer.Length;
-        await response.OutputStream.WriteAsync(buffer, 0, buffer.Length).ConfigureAwait(false);
+        await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
     }
 
     static void WriteLog(HttpListenerRequest request, int statusCode, string logFile, object logLock)
