@@ -43,14 +43,12 @@ class Program
         var activeTasks = new List<Task>();
         var tasksLock = new object();
 
-        using var acceptCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-
         try
         {
-            while (!acceptCts.Token.IsCancellationRequested)
+            while (!cancellationToken.IsCancellationRequested)
             {
                 var getContextTask = listener.GetContextAsync();
-                var completedTask = await Task.WhenAny(getContextTask, Task.Delay(-1, acceptCts.Token));
+                var completedTask = await Task.WhenAny(getContextTask, Task.Delay(-1, cancellationToken));
 
                 if (completedTask == getContextTask)
                 {
